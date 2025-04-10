@@ -3,6 +3,9 @@ package api
 import (
 	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -48,13 +51,32 @@ func activated(taker Taker) error {
 	maxFeePerGas := new(big.Int).SetUint64(1500000001)         // 1.51 Gwei
 	maxPriorityFeePerGas := new(big.Int).SetUint64(1500000000) // 1.5 Gwei
 
+	// 获取当前网络 Gas 建议价
+	gasTipCap, _ := bscClient.SuggestGasTipCap(context.Background())
+	gasFeeCap, _ := bscClient.SuggestGasPrice(context.Background())
+	//gasLimit, _ := bscClient.EstimateGas(context.Background())
+
+	if gasFeeCap == nil || gasTipCap == nil {
+		gasFeeCap = maxFeePerGas
+		gasTipCap = maxPriorityFeePerGas
+	}
+	// 确保 MaxFee ≥ MaxPriorityFee
+	if gasFeeCap.Cmp(gasTipCap) < 0 {
+		gasFeeCap = new(big.Int).Mul(gasTipCap, big.NewInt(2))
+	}
+
+	gasLimit, err := estimateGasLimit(bscClient, address, toAddress, byteData)
+	if err != nil {
+		return errors.New(fmt.Sprintf("账号%dGas估算失败: %v，跳过", taker.ID, err))
+	}
+
 	// 构建 EIP-1559 类型的交易
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   big.NewInt(1125),
 		Nonce:     nonce,
-		GasFeeCap: maxFeePerGas,
-		GasTipCap: maxPriorityFeePerGas,
-		Gas:       130224, //130224,63000, // 转账交易通常需要 21000 Gas
+		GasFeeCap: gasFeeCap,
+		GasTipCap: gasFeeCap,
+		Gas:       gasLimit, //130224,63000, // 转账交易通常需要 21000 Gas
 		To:        &toAddress,
 		Value:     big.NewInt(0),
 		Data:      byteData,
@@ -89,12 +111,60 @@ func activated(taker Taker) error {
 	// 发送交易
 	err = bscClient.SendTransaction(context.Background(), signedTx)
 	if err != nil {
+		if strings.Contains(err.Error(), "insufficient funds for gas * price + value") {
+			color.Yellow("账号%d余额不足，跳过")
+			return nil // 余额不足直接退出
+		}
 		color.Red("交易手续费失败7:%s", err)
 		return err
 	}
 
-	color.Green("第%d行，地址%s交易成功，交易哈希：%s\n", taker.ID, taker.Address, signedTx.Hash().Hex())
-	// 网站上确定hash
-	time.Sleep(5 * time.Second)
+	// 新增：获取交易收据验证状态
+	txHash := signedTx.Hash()
+	var receipt *types.Receipt
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	color.Yellow("账号%d交易hash：%s，等待上链", taker.ID, signedTx.Hash().Hex())
+	// 轮询获取收据（最多尝试36次，每次间隔5秒）
+	for i := 0; i < 36; i++ {
+		receipt, err = bscClient.TransactionReceipt(ctx, txHash)
+		if err == nil {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	if err != nil || receipt == nil {
+		color.Red("账号%d无法获取本次交易收据:%s", taker.ID, err)
+		return fmt.Errorf("transaction receipt failed: %v", err)
+	}
+
+	if receipt.Status != 1 {
+		color.Red("账号%d交易执行失败，区块高度：#%v", taker.ID, receipt.BlockNumber)
+		return fmt.Errorf("transaction reverted")
+	}
+
+	fmt.Printf("账号%d，地址%sMint成功，交易哈希：%s\n", taker.ID, taker.Address, signedTx.Hash().Hex())
 	return nil
+
+}
+
+func estimateGasLimit(client *ethclient.Client, from common.Address, to common.Address, data []byte) (uint64, error) {
+	msg := ethereum.CallMsg{
+		From:  from,
+		To:    &to,
+		Value: big.NewInt(0),
+		Data:  data,
+	}
+
+	// 基础估算
+	gas, err := client.EstimateGas(context.Background(), msg)
+	if err != nil {
+		return 0, fmt.Errorf("%v", err)
+	}
+
+	// 添加20%缓冲
+	buffered := gas * 110 / 100
+	return buffered, nil
 }
